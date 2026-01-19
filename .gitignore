@@ -1,0 +1,9 @@
+concepts.csv
+members_delta.csv
+__pycache__
+.ipynb_checkpoints
+*.png
+.idea
+*.bin
+*.txt
+results
