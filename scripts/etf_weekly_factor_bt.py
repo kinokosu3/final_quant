@@ -11,6 +11,95 @@ def _parse_date(s: str) -> dt.date:
     return dt.datetime.strptime(s, "%Y-%m-%d").date()
 
 
+def _canonical_code(code: str) -> str:
+    """Normalize instrument code to `159133.SZ` style for mapping."""
+    s = (code or "").strip()
+    if not s:
+        return ""
+    parts = s.split(".")
+    if len(parts) != 2:
+        return s.upper()
+    sym, market = parts[0].strip(), parts[1].strip()
+    if not sym:
+        return s.upper()
+    if not market:
+        return sym.upper()
+    return f"{sym}.{market.upper()}"
+
+
+def _read_stock_name_map(path: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
+    if not path:
+        return out
+    if not os.path.exists(path):
+        return out
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            if line.startswith("#"):
+                continue
+            if "," not in line:
+                continue
+            code, name = line.split(",", 1)
+            code = _canonical_code(code)
+            name = (name or "").strip()
+            if not code or not name:
+                continue
+            out[code] = name
+    return out
+
+
+def _instrument_display_name(inst: str, name_map: Optional[Dict[str, str]]) -> str:
+    if not inst:
+        return ""
+    if not name_map:
+        return inst
+    key = _canonical_code(inst)
+    return name_map.get(key, inst)
+
+
+def _write_quantstats_report(returns: pd.Series, out_dir: str, title: str) -> Optional[str]:
+    """Generate quantstats HTML report if quantstats is available."""
+    try:
+        import quantstats as qs
+    except Exception:
+        return None
+
+    if returns is None or returns.empty:
+        return None
+
+    s = returns.copy()
+    s.index = pd.to_datetime(s.index)
+    try:
+        # Drop tz info if any.
+        s.index = s.index.tz_localize(None)
+    except Exception:
+        pass
+    s = pd.to_numeric(s, errors="coerce").dropna().sort_index()
+    if s.empty:
+        return None
+
+    _ensure_dir(out_dir)
+    html_path = os.path.join(out_dir, "quantstats_report.html")
+
+    # QuantStats API differs across versions; handle both "write-to-file" and "return-html" styles.
+    try:
+        qs.reports.html(s, output=html_path, title=title)
+        return html_path
+    except TypeError:
+        try:
+            html = qs.reports.html(s, title=title)
+        except Exception:
+            return None
+        if isinstance(html, str) and html.strip():
+            with open(html_path, "w", encoding="utf-8", newline="\n") as f:
+                f.write(html)
+            return html_path
+        return None
+
+
 def _ensure_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
 
@@ -190,11 +279,22 @@ def _collect_union_universe(targets_by_day: Dict[pd.Timestamp, Dict[str, float]]
     return sorted(s)
 
 
-def _dump_targets(targets_by_day: Dict[pd.Timestamp, Dict[str, float]], out_dir: str) -> None:
+def _dump_targets(
+    targets_by_day: Dict[pd.Timestamp, Dict[str, float]],
+    out_dir: str,
+    stock_name_map: Optional[Dict[str, str]] = None,
+) -> None:
     rows: List[Dict[str, object]] = []
     for d, w_map in sorted(targets_by_day.items(), key=lambda x: x[0]):
         for inst, w in sorted(w_map.items()):
-            rows.append({"date": str(_dt_to_ts(d).date()), "instrument": inst, "target_weight": float(w)})
+            rows.append(
+                {
+                    "date": str(_dt_to_ts(d).date()),
+                    "instrument": inst,
+                    "instrument_name": _instrument_display_name(inst, stock_name_map),
+                    "target_weight": float(w),
+                }
+            )
     if not rows:
         return
     _ensure_dir(out_dir)
@@ -229,6 +329,48 @@ def _load_ohlcv_for_backtrader(
     return out
 
 
+def _filter_price_map_by_start(
+    price_map: Dict[str, pd.DataFrame],
+    start_time: str,
+) -> Tuple[Dict[str, pd.DataFrame], List[Dict[str, object]]]:
+    """Drop instruments whose first available bar is after `start_time`.
+
+    Backtrader's multi-data clock effectively starts when all feeds have bars.
+    Late-starting instruments can push the whole backtest forward.
+    """
+    start_ts = pd.Timestamp(start_time).normalize()
+    kept: Dict[str, pd.DataFrame] = {}
+    dropped: List[Dict[str, object]] = []
+
+    for inst, df in price_map.items():
+        if df is None or df.empty:
+            dropped.append({"instrument": inst, "reason": "empty"})
+            continue
+        first = pd.to_datetime(df.index.min()).normalize()
+        if first <= start_ts:
+            kept[inst] = df
+        else:
+            dropped.append({"instrument": inst, "reason": f"first_bar={str(first.date())}"})
+
+    return kept, dropped
+
+
+def _filter_and_renormalize_targets(
+    targets_by_day: Dict[pd.Timestamp, Dict[str, float]],
+    universe: Set[str],
+) -> Dict[pd.Timestamp, Dict[str, float]]:
+    out: Dict[pd.Timestamp, Dict[str, float]] = {}
+    for d, m in targets_by_day.items():
+        kept = {k: float(v) for k, v in m.items() if k in universe}
+        if not kept:
+            continue
+        s = float(sum(kept.values()))
+        if s > 0:
+            kept = {k: float(v) / s for k, v in kept.items()}
+        out[d] = kept
+    return out
+
+
 def _is_tradable_in_bt(data) -> bool:
     try:
         v = float(data.volume[0])
@@ -253,6 +395,7 @@ def run_backtrader(
     slippage: float,
     stamp_duty: float,
     out_dir: str,
+    stock_name_map: Optional[Dict[str, str]] = None,
 ) -> None:
     import backtrader as bt
 
@@ -295,6 +438,8 @@ def run_backtrader(
             self._targets_by_day = self.p.targets_by_day or {}
             self._rebal_days = sorted(_dt_to_ts(d) for d in self._targets_by_day.keys())
             self._positions_log: List[Dict[str, object]] = []
+            self._rebalance_diag: List[Dict[str, object]] = []
+            self._clock_diag: List[Dict[str, object]] = []
 
         def notify_order(self, order):
             # Keep hook in case we want to log trades later.
@@ -306,6 +451,24 @@ def run_backtrader(
                 return
 
             cur_dt = _dt_to_ts(self.datas[0].datetime.date(0))
+            cur_key = cur_dt
+            cur_key_str = str(cur_dt.date())
+
+            # Diagnostic: daily clock vs targets keys
+            if len(self._clock_diag) < 400:
+                self._clock_diag.append(
+                    {
+                        "date": cur_key_str,
+                        "has_targets_key": bool(cur_key in self._targets_by_day),
+                        "targets_keys_type": str(type(next(iter(self._targets_by_day.keys()), None))),
+                        "targets_keys_min": str(min(self._targets_by_day.keys()).date())
+                        if self._targets_by_day
+                        else "",
+                        "targets_keys_max": str(max(self._targets_by_day.keys()).date())
+                        if self._targets_by_day
+                        else "",
+                    }
+                )
 
             # Daily positions snapshot.
             value = float(self.broker.getvalue())
@@ -327,10 +490,55 @@ def run_backtrader(
                     }
                 )
 
-            if cur_dt not in self._targets_by_day:
+            if cur_key not in self._targets_by_day:
                 return
 
-            targets = self._targets_by_day[cur_dt]
+            targets = self._targets_by_day[cur_key]
+
+            # Rebalance diagnostics to understand why returns may be flat/late.
+            # We try to capture: (1) no bar yet, (2) volume missing/zero, (3) close missing.
+            data_by_name = {d._name: d for d in self.datas}
+            blocked: List[str] = []
+            ok: List[str] = []
+
+            for inst in sorted(targets.keys()):
+                d = data_by_name.get(inst)
+                if d is None:
+                    blocked.append(f"{inst}:no_data")
+                    continue
+                if len(d) == 0:
+                    blocked.append(f"{inst}:no_bar")
+                    continue
+                try:
+                    c = float(d.close[0])
+                except Exception:
+                    c = float("nan")
+                if c != c:  # NaN
+                    blocked.append(f"{inst}:nan_close")
+                    continue
+                try:
+                    v = float(d.volume[0])
+                except Exception:
+                    blocked.append(f"{inst}:no_volume")
+                    continue
+                if v != v:
+                    blocked.append(f"{inst}:nan_vol")
+                    continue
+                if v <= 0:
+                    blocked.append(f"{inst}:vol<=0")
+                    continue
+                ok.append(inst)
+
+            self._rebalance_diag.append(
+                {
+                    "date": str(cur_dt.date()),
+                    "targets": int(len(targets)),
+                    "ok": int(len(ok)),
+                    "blocked": int(len(blocked)),
+                    "blocked_sample": ";".join(blocked[:8]),
+                    "portfolio_value": float(self.broker.getvalue()),
+                }
+            )
 
             # Sell dropped names first.
             for d in self.datas:
@@ -345,23 +553,53 @@ def run_backtrader(
                 self.order_target_percent(d, target=0.0)
 
             # Buy/adjust selected names.
-            for d in self.datas:
-                inst = d._name
-                if inst not in targets:
+            for inst, w in targets.items():
+                d = data_by_name.get(inst)
+                if d is None:
                     continue
                 if not _is_tradable_in_bt(d):
                     continue
-                self.order_target_percent(d, target=float(targets[inst]))
+                self.order_target_percent(d, target=float(w))
 
         def stop(self):
-            if not self._positions_log:
-                return
             if not self.p.out_dir:
                 return
             _ensure_dir(self.p.out_dir)
-            pd.DataFrame(self._positions_log).to_csv(os.path.join(self.p.out_dir, "positions.csv"), index=False)
+
+            if self._positions_log:
+                df_pos = pd.DataFrame(self._positions_log)
+                if stock_name_map is not None and not df_pos.empty and "instrument" in df_pos.columns:
+                    df_pos["instrument_name"] = df_pos["instrument"].map(
+                        lambda x: _instrument_display_name(str(x), stock_name_map)
+                    )
+                df_pos.to_csv(os.path.join(self.p.out_dir, "positions.csv"), index=False)
+
+            if self._rebalance_diag:
+                pd.DataFrame(self._rebalance_diag).to_csv(
+                    os.path.join(self.p.out_dir, "rebalance_diagnostics.csv"), index=False
+                )
+
+            if self._clock_diag:
+                pd.DataFrame(self._clock_diag).to_csv(
+                    os.path.join(self.p.out_dir, "clock_diagnostics.csv"), index=False
+                )
 
     cerebro = bt.Cerebro(stdstats=False)
+
+    # Diagnostic: target keys coverage
+    try:
+        _ensure_dir(out_dir)
+        keys = list(targets_by_day.keys())
+        keys_ts = [_dt_to_ts(k) for k in keys]
+        with open(os.path.join(out_dir, "targets_key_info.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"keys={len(keys)}\n")
+            f.write(f"type0={type(keys[0]).__name__ if keys else ''}\n")
+            f.write(f"min={str(min(keys_ts).date()) if keys_ts else ''}\n")
+            f.write(f"max={str(max(keys_ts).date()) if keys_ts else ''}\n")
+            for i, k in enumerate(sorted(keys_ts)[:10]):
+                f.write(f"sample[{i}]={str(k)}\n")
+    except Exception:
+        pass
 
     cerebro.broker.setcash(float(cash))
     cerebro.broker.addcommissioninfo(AShareLikeCommission())
@@ -369,9 +607,30 @@ def run_backtrader(
         cerebro.broker.set_slippage_perc(perc=float(slippage))
 
     # Feeds
+    # NOTE: In Backtrader, the 1st added data often becomes the master clock.
+    # If that instrument starts late (missing early bars), the whole backtest may start late.
+    # We log feed ranges to validate this assumption.
+    feed_rows: List[Dict[str, object]] = []
+    master_inst = next(iter(price_map.keys()), None)
+
     for inst, df in price_map.items():
+        idx = pd.to_datetime(df.index) if df is not None and not df.empty else pd.DatetimeIndex([])
+        feed_rows.append(
+            {
+                "instrument": inst,
+                "instrument_name": _instrument_display_name(inst, stock_name_map),
+                "is_master": bool(master_inst is not None and inst == master_inst),
+                "start": str(idx.min().date()) if len(idx) else "",
+                "end": str(idx.max().date()) if len(idx) else "",
+                "bars": int(len(idx)),
+            }
+        )
         data = PandasOHLCV(dataname=df, fromdate=pd.Timestamp(start_time), todate=pd.Timestamp(end_time))
         cerebro.adddata(data, name=inst)
+
+    if feed_rows:
+        _ensure_dir(out_dir)
+        pd.DataFrame(feed_rows).to_csv(os.path.join(out_dir, "feed_info.csv"), index=False)
 
     cerebro.addstrategy(WeeklyRebalanceStrategy, targets_by_day=targets_by_day, out_dir=out_dir)
 
@@ -387,8 +646,28 @@ def run_backtrader(
     tr = strat.analyzers.timereturn.get_analysis()
     s = pd.Series(tr)
     s.index = pd.to_datetime(s.index)
-    equity = (1.0 + s).cumprod() * float(cash)
+
+    returns = pd.to_numeric(s, errors="coerce").fillna(0.0)
+    returns.to_csv(os.path.join(out_dir, "returns.csv"), header=["returns"])  # type: ignore
+
+    # Diagnostic: persist TimeReturn coverage
+    try:
+        tr_start = str(pd.to_datetime(returns.index.min()).date()) if not returns.empty else ""
+        tr_end = str(pd.to_datetime(returns.index.max()).date()) if not returns.empty else ""
+        with open(os.path.join(out_dir, "timereturn_info.txt"), "w", encoding="utf-8", newline="\n") as f:
+            f.write(f"rows={int(len(returns))}\n")
+            f.write(f"start={tr_start}\n")
+            f.write(f"end={tr_end}\n")
+    except Exception:
+        pass
+
+    equity = (1.0 + returns).cumprod() * float(cash)
     equity.to_csv(os.path.join(out_dir, "equity_curve.csv"), header=["equity"])  # type: ignore
+
+    title = "ETF Weekly Factor Backtrader"
+    if stock_name_map:
+        title = f"{title} (names mapped)"
+    _write_quantstats_report(returns=returns, out_dir=out_dir, title=title)
 
     dd = strat.analyzers.drawdown.get_analysis()
 
@@ -412,11 +691,17 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--slippage", type=float, default=0.0005)
     p.add_argument("--stamp_duty", type=float, default=0.001)
     p.add_argument("--out_dir", default=os.path.join("results", "etf_weekly"))
+    p.add_argument("--stock_name_map", default="mapped_stocks.txt")
+    p.add_argument(
+        "--allow_late_start_instruments",
+        action="store_true",
+        help="Allow instruments that start after --start (may delay backtest start in multi-data mode)",
+    )
 
     args = p.parse_args(list(argv) if argv is not None else None)
 
     cal_path = os.path.join(args.qlib_dir, "calendars", "day.txt")
-    inst_path = os.path.join(args.qlib_dir, "instruments", "all.txt")
+    inst_path = os.path.join(args.qlib_dir, "instruments", "filtered.txt")
 
     calendar = _read_calendar(cal_path)
     if not calendar:
@@ -433,6 +718,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     instruments_raw = _read_instruments(inst_path)
     instruments = [_to_qlib_inst(x) for x in instruments_raw]
+
+    stock_name_map = _read_stock_name_map(args.stock_name_map)
 
     _init_qlib(args.qlib_dir)
 
@@ -453,12 +740,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         end_time=str(calendar[-1].date()),
     )
 
+    dropped_instruments: List[Dict[str, object]] = []
+    if not args.allow_late_start_instruments:
+        price_map, dropped_instruments = _filter_price_map_by_start(price_map, start_time=str(calendar[0].date()))
+        if dropped_instruments:
+            _ensure_dir(args.out_dir)
+            pd.DataFrame(dropped_instruments).to_csv(
+                os.path.join(args.out_dir, "dropped_instruments.csv"), index=False
+            )
+
     # Normalize keys to match BT data names.
     targets_norm: Dict[pd.Timestamp, Dict[str, float]] = {}
     for d, m in targets_by_day.items():
         targets_norm[_dt_to_ts(d)] = {k: float(v) for k, v in m.items() if k in price_map}
 
-    _dump_targets(targets_norm, args.out_dir)
+    # Ensure targets align with the final tradable universe and re-normalize weights.
+    targets_norm = _filter_and_renormalize_targets(targets_norm, set(price_map.keys()))
+
+    _dump_targets(targets_norm, args.out_dir, stock_name_map=stock_name_map)
 
     run_backtrader(
         price_map=price_map,
@@ -470,6 +769,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         slippage=args.slippage,
         stamp_duty=args.stamp_duty,
         out_dir=args.out_dir,
+        stock_name_map=stock_name_map,
     )
 
     return 0
