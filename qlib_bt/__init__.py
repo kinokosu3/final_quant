@@ -12,4 +12,5 @@ __all__ = [
     "reports",
     "exports",
     "factor_analysis_integration",
+    "llm_agent",
 ]

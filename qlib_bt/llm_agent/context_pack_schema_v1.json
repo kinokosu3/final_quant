@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://example.local/qlib_bt/llm_context_pack.schema.json",
+  "title": "Backtest LLM Context Pack",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run", "strategy", "benchmarks", "pipeline", "risk", "factors", "artifacts"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "run": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["out_dir", "git_head", "start", "end"],
+      "properties": {
+        "out_dir": {"type": "string"},
+        "git_head": {"type": ["string", "null"]},
+        "start": {"type": "string"},
+        "end": {"type": "string"}
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["pre_risk", "post_risk", "delta"],
+      "properties": {
+        "pre_risk": {"$ref": "#/$defs/strategyMetrics"},
+        "post_risk": {"$ref": "#/$defs/strategyMetrics"},
+        "delta": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["delta_ann_return", "delta_max_drawdown"],
+          "properties": {
+            "delta_ann_return": {"type": ["number", "null"]},
+            "delta_max_drawdown": {"type": ["number", "null"]}
+          }
+        }
+      }
+    },
+    "benchmarks": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["list", "excess"],
+      "properties": {
+        "list": {"type": "array", "items": {"type": "string"}},
+        "excess": {
+          "type": "object",
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ann_return"],
+            "properties": {
+              "ann_return": {"type": ["number", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "pipeline": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["coverage", "filters", "turnover"],
+      "properties": {
+        "coverage": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["universe_mean", "eligible_mean"],
+          "properties": {
+            "universe_mean": {"type": ["number", "null"]},
+            "eligible_mean": {"type": ["number", "null"]}
+          }
+        },
+        "filters": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["liquidity_bind_rate", "tradable_bind_rate"],
+          "properties": {
+            "liquidity_bind_rate": {"type": ["number", "null"]},
+            "tradable_bind_rate": {"type": ["number", "null"]}
+          }
+        },
+        "turnover": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["weekly_avg_pre_risk", "weekly_avg_post_trend"],
+          "properties": {
+            "weekly_avg_pre_risk": {"type": ["number", "null"]},
+            "weekly_avg_post_trend": {"type": ["number", "null"]}
+          }
+        }
+      }
+    },
+    "risk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trend", "stop_loss"],
+      "properties": {
+        "trend": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["ma", "risk_off_scale", "trigger_rate"],
+          "properties": {
+            "ma": {"type": "integer"},
+            "risk_off_scale": {"type": "number"},
+            "trigger_rate": {"type": ["number", "null"]}
+          }
+        },
+        "stop_loss": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["threshold", "events"],
+          "properties": {
+            "threshold": {"type": ["number", "null"]},
+            "events": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["count", "sample"],
+              "properties": {
+                "count": {"type": "integer"},
+                "sample": {
+                  "type": "array",
+                  "items": {"$ref": "#/$defs/stopLossEventSample"},
+                  "maxItems": 20
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "factors": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["signals"],
+      "properties": {
+        "signals": {
+          "type": "array",
+          "items": {"$ref": "#/$defs/factorSignal"}
+        }
+      }
+    },
+    "artifacts": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["metrics", "manifest"],
+      "properties": {
+        "metrics": {"type": "string"},
+        "manifest": {"type": "string"}
+      }
+    }
+  },
+  "$defs": {
+    "strategyMetrics": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["ann_return", "ann_vol", "sharpe", "max_drawdown"],
+      "properties": {
+        "ann_return": {"type": ["number", "null"]},
+        "ann_vol": {"type": ["number", "null"]},
+        "sharpe": {"type": ["number", "null"]},
+        "max_drawdown": {"type": ["number", "null"]}
+      }
+    },
+    "factorSignal": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "ic_ir", "ic_mean", "spread_ir", "turnover"],
+      "properties": {
+        "name": {"type": "string"},
+        "ic_ir": {"type": ["number", "null"]},
+        "ic_mean": {"type": ["number", "null"]},
+        "spread_ir": {"type": ["number", "null"]},
+        "turnover": {"type": ["number", "null"]}
+      }
+    },
+    "stopLossEventSample": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["date", "instrument", "drawdown"],
+      "properties": {
+        "date": {"type": "string"},
+        "instrument": {"type": "string"},
+        "drawdown": {"type": ["number", "null"]},
+        "fwd_ret_5d": {"type": ["number", "null"]},
+        "fwd_ret_20d": {"type": ["number", "null"]}
+      }
+    }
+  }
+}

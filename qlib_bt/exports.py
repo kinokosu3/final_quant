@@ -13,6 +13,20 @@ def dump_targets_csv(
     out_dir: str,
     stock_name_map: Optional[Dict[str, str]] = None,
 ) -> None:
+    dump_targets_csv_named(
+        targets_by_day=targets_by_day,
+        out_dir=out_dir,
+        filename="targets.csv",
+        stock_name_map=stock_name_map,
+    )
+
+
+def dump_targets_csv_named(
+    targets_by_day: Dict[pd.Timestamp, Dict[str, float]],
+    out_dir: str,
+    filename: str,
+    stock_name_map: Optional[Dict[str, str]] = None,
+) -> None:
     rows: List[Dict[str, object]] = []
     for d, w_map in sorted(targets_by_day.items(), key=lambda x: x[0]):
         for inst, w in sorted(w_map.items()):
@@ -27,7 +41,8 @@ def dump_targets_csv(
     if not rows:
         return
     ensure_dir(out_dir)
-    pd.DataFrame(rows).to_csv(os.path.join(out_dir, "targets.csv"), index=False)
+    name = (filename or "targets.csv").strip() or "targets.csv"
+    pd.DataFrame(rows).to_csv(os.path.join(out_dir, name), index=False)
 
 
 def dump_positions_csv(

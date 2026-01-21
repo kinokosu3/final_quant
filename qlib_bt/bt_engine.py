@@ -87,6 +87,7 @@ def run_backtrader(
     stamp_duty: float,
     out_dir: str,
     stock_name_map: Optional[Dict[str, str]] = None,
+    stop_loss: Optional[float] = None,
 ) -> BacktestResult:
     import backtrader as bt
 
@@ -123,16 +124,38 @@ def run_backtrader(
         params = (
             ("targets_by_day", None),
             ("out_dir", None),
+            ("stop_loss", None),
         )
 
         def __init__(self):
             self._targets_by_day = self.p.targets_by_day or {}
             self._rebal_days = sorted(dt_to_ts(d) for d in self._targets_by_day.keys())
             self._positions_log: List[Dict[str, object]] = []
+            self._stop_loss_events: List[Dict[str, object]] = []
+            self._entry_price: Dict[str, float] = {}
+            self._stop_loss: Optional[float] = None
+            try:
+                if self.p.stop_loss is not None:
+                    self._stop_loss = float(self.p.stop_loss)
+            except Exception:
+                self._stop_loss = None
+            if self._stop_loss is not None and self._stop_loss <= 0:
+                self._stop_loss = None
 
         def notify_order(self, order):
             if order.status not in (order.Completed, order.Canceled, order.Margin, order.Rejected):
                 return
+
+            # Track entry price on completed BUYs for stop-loss.
+            try:
+                if order.status == order.Completed and order.isbuy():
+                    inst = getattr(order.data, "_name", None)
+                    if inst:
+                        px = float(getattr(order.executed, "price", 0.0) or 0.0)
+                        if px > 0:
+                            self._entry_price[str(inst)] = px
+            except Exception:
+                pass
 
         def next(self):
             if not self.datas:
@@ -159,6 +182,36 @@ def run_backtrader(
                         "portfolio_value": value,
                     }
                 )
+
+            # Stop-loss check: evaluate on close, execute next day by issuing order_target_percent(0).
+            if self._stop_loss is not None and float(self._stop_loss) > 0:
+                for d in self.datas:
+                    inst = d._name
+                    pos = self.getposition(d)
+                    if pos.size <= 0:
+                        continue
+                    if not _is_tradable_in_bt(d):
+                        continue
+                    entry = self._entry_price.get(str(inst))
+                    if entry is None or entry <= 0:
+                        continue
+                    price = float(d.close[0]) if len(d.close) else float("nan")
+                    if not (price == price) or price <= 0:
+                        continue
+                    dd = (price / float(entry)) - 1.0
+                    if dd <= -float(self._stop_loss):
+                        self._stop_loss_events.append(
+                            {
+                                "date": str(cur_dt.date()),
+                                "instrument": str(inst),
+                                "entry_price": float(entry),
+                                "close": float(price),
+                                "drawdown": float(dd),
+                                "stop_loss": float(self._stop_loss),
+                            }
+                        )
+                        # Force liquidation; keep remaining targets logic (rebalance) for others.
+                        self.order_target_percent(d, target=0.0)
 
             if cur_key not in self._targets_by_day:
                 return
@@ -191,6 +244,12 @@ def run_backtrader(
             ensure_dir(self.p.out_dir)
             dump_positions_csv(self._positions_log, self.p.out_dir, stock_name_map=stock_name_map)
 
+            if self._stop_loss_events:
+                pd.DataFrame(self._stop_loss_events).to_csv(
+                    os.path.join(self.p.out_dir, "stop_loss_events.csv"),
+                    index=False,
+                )
+
     cerebro = bt.Cerebro(stdstats=False)
 
     ensure_dir(out_dir)
@@ -222,7 +281,12 @@ def run_backtrader(
         data = PandasOHLCV(dataname=df, fromdate=pd.Timestamp(start_time), todate=pd.Timestamp(end_time))
         cerebro.adddata(data, name=inst)
 
-    cerebro.addstrategy(WeeklyRebalanceStrategy, targets_by_day=targets_by_day, out_dir=out_dir)
+    cerebro.addstrategy(
+        WeeklyRebalanceStrategy,
+        targets_by_day=targets_by_day,
+        out_dir=out_dir,
+        stop_loss=stop_loss,
+    )
     cerebro.addanalyzer(bt.analyzers.TimeReturn, _name="timereturn")
     cerebro.addanalyzer(bt.analyzers.DrawDown, _name="drawdown")
 

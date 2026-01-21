@@ -307,6 +307,54 @@ def _filter_hk_codes(hk_codes: Iterable[str], prefixes: Sequence[str]) -> List[s
     return sorted(set(out))
 
 
+def _read_code_tokens_from_file(path: str) -> List[str]:
+    if not path:
+        return []
+    if not os.path.exists(path):
+        raise FileNotFoundError(f"codes_file not found: {path}")
+
+    tokens: List[str] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line in f:
+            line = (line or "").strip()
+            if not line or line.startswith("#"):
+                continue
+            # Allow both CSV-ish and whitespace-separated formats.
+            for part in line.replace("\t", " ").replace(",", " ").split():
+                part = (part or "").strip()
+                if part:
+                    tokens.append(part)
+    return tokens
+
+
+def _tokens_to_hk_codes(tokens: Iterable[str], prefixes: Sequence[str]) -> List[str]:
+    """Convert mixed code tokens to hikyuu market_code format.
+
+    Accepted token formats:
+    - hikyuu: sh510300 / sz159915
+    - qlib: 510300.SH / 159915.SZ
+    """
+
+    out: List[str] = []
+    for t in tokens:
+        t = (t or "").strip()
+        if not t:
+            continue
+
+        if "." in t:
+            hk_code = map_qlib_code_to_hikyuu(t)
+            if hk_code:
+                out.append(hk_code)
+            continue
+
+        prefix = t[:2].lower() if len(t) >= 2 else ""
+        if prefix in ("sh", "sz"):
+            out.append(t.lower())
+            continue
+
+    return _filter_hk_codes(out, prefixes=prefixes)
+
+
 def main(argv: Optional[Sequence[str]] = None) -> int:
     p = argparse.ArgumentParser(
         description="Build a minimal Qlib CN dump_bin-style dataset from local Hikyuu daily bars"
@@ -315,7 +363,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     p.add_argument("--start_date", default=None, help="YYYY-MM-DD (inclusive)")
     p.add_argument("--end_date", default=None, help="YYYY-MM-DD (inclusive)")
     p.add_argument("--count", type=int, default=None, help="latest N trading days")
+
     p.add_argument("--prefixes", default="sz,sh", help="comma-separated: sz,sh")
+    p.add_argument(
+        "--security_types",
+        default="etf",
+        help="comma-separated security types for get_all_codes() (e.g. etf,index,stock)",
+    )
+    p.add_argument(
+        "--codes",
+        default=None,
+        help="comma-separated codes to export (accepts qlib 510300.SH or hikyuu sh510300)",
+    )
+    p.add_argument(
+        "--codes_file",
+        default=None,
+        help="file containing codes to export (one per line; accepts qlib 510300.SH or hikyuu sh510300)",
+    )
+
     p.add_argument("--limit", type=int, default=None, help="limit instruments for quick runs")
     p.add_argument("--no_calendar", action="store_true")
     p.add_argument("--no_instruments", action="store_true")
@@ -326,8 +391,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     r = Range(start=_parse_date(args.start_date), end=_parse_date(args.end_date))
     prefixes = [x.strip() for x in args.prefixes.split(",") if x.strip()]
-    
-    ds = get_data_source('hk')
+
+    ds = get_data_source("hk")
     cal_path = os.path.join(args.qlib_dir, "calendars", "day.txt")
     inst_path = os.path.join(args.qlib_dir, "instruments", "all.txt")
 
@@ -337,8 +402,20 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     else:
         calendar = build_calendar(ds, out_path=cal_path, r=r, count=args.count)
 
-    hk_codes = ds.get_all_codes("etf")
-    hk_codes = _filter_hk_codes(hk_codes, prefixes=prefixes)
+    tokens: List[str] = []
+    if args.codes_file:
+        tokens.extend(_read_code_tokens_from_file(str(args.codes_file)))
+    if args.codes:
+        tokens.extend([x.strip() for x in str(args.codes).replace(",", " ").split() if x.strip()])
+
+    if tokens:
+        hk_codes = _tokens_to_hk_codes(tokens, prefixes=prefixes)
+    else:
+        sec_types = [x.strip() for x in str(args.security_types).split(",") if x.strip()]
+        hk_codes = []
+        for t in sec_types:
+            hk_codes.extend(ds.get_all_codes(t))
+        hk_codes = _filter_hk_codes(hk_codes, prefixes=prefixes)
 
     if args.no_instruments:
         qlib_codes = [c for c in (map_hikyuu_code_to_qlib(x) for x in hk_codes) if c is not None]

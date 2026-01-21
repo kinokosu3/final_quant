@@ -2,7 +2,7 @@ import argparse
 import json
 import os
 import sys
-from typing import Optional, Sequence
+from typing import Dict, Optional, Sequence, Tuple
 
 _REPO_ROOT = os.path.abspath(os.path.join(os.path.dirname(__file__), os.pardir))
 if _REPO_ROOT not in sys.path:
@@ -10,6 +10,7 @@ if _REPO_ROOT not in sys.path:
 
 import pandas as pd
 
+from factor_analysis.group_back_testing import GroupBackTesting
 from factor_analysis.signal_analyzer import SignalAnalyzer
 from qlib_bt.factor_analysis_integration import (
     load_factor_analysis_meta,
@@ -45,6 +46,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
 
     p.add_argument("--no_ic", action="store_true", help="Skip IC analysis")
     p.add_argument("--no_return", action="store_true", help="Skip layered return analysis")
+    p.add_argument("--no_turnover", action="store_true", help="Skip turnover analysis")
 
     p.add_argument("--bins", type=int, default=None, help="Override bins (default from meta)")
     p.add_argument(
@@ -70,6 +72,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             json.dump(diag, f, ensure_ascii=False, indent=2)
 
     ret_path = os.path.join(fa_dir, "ret.parquet")
+
+    def _safe_float(x) -> Optional[float]:
+        try:
+            if x is None:
+                return None
+            v = float(x)
+            if v != v:
+                return None
+            return v
+        except Exception:
+            return None
+
+    def _series_summary(s: pd.Series) -> Dict[str, Optional[float]]:
+        s = pd.to_numeric(s, errors="coerce").dropna()
+        if s.empty:
+            return {"mean": None, "std": None, "ir": None}
+        mean = float(s.mean())
+        std = float(s.std(ddof=0))
+        ir = mean / std if std > 0 else None
+        return {"mean": mean, "std": std, "ir": _safe_float(ir)}
 
     def _run_one(sig_name: str, sig_file: str) -> None:
         sig_path = os.path.join(fa_dir, sig_file)
@@ -98,11 +120,78 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         out_subdir = os.path.join(fa_dir, f"signal={sig_name}")
         _chdir(out_subdir)
 
+        metrics: Dict[str, object] = {
+            "schema_version": 1,
+            "signal": {"name": str(sig_name), "file": str(sig_file)},
+            "meta": {
+                "start": meta.start,
+                "end": meta.end,
+                "freq": int(meta.freq),
+                "offset": str(meta.offset),
+                "bins": int(bins),
+            },
+            "data": {
+                "rows": int(len(sig)),
+                "dates": int(sig["datetime"].dt.normalize().nunique()) if "datetime" in sig.columns else None,
+                "codes": int(sig["code"].nunique()) if "code" in sig.columns else None,
+                "null_rate": float(pd.to_numeric(sig["signal"], errors="coerce").isna().mean()) if "signal" in sig.columns else None,
+            },
+        }
+
         if not args.no_ic:
             analyzer.ic_analysis()
+            # Recompute rank-IC numerically for metrics output.
+            analyzer.get_signal()
+            analyzer.get_ret()
+            rank_ic = analyzer.signal_df.reindex(analyzer.ret_df.index).corrwith(
+                analyzer.ret_df, method="spearman", axis=1
+            )
+            metrics["ic"] = {
+                "rank_ic": _series_summary(rank_ic),
+                "positive_rate": _safe_float((rank_ic > 0).mean()),
+            }
 
         if not args.no_return:
             analyzer.return_analysis(weights_mode="equal", non_linear=False)
+            # Numeric quantile spread summary
+            analyzer.get_signal()
+            analyzer.ret_1d = analyzer.__getattribute__("ret_data").to_dataframes()
+            if "factor" in analyzer.ret_1d:
+                analyzer.ret_1d = analyzer.ret_1d["close"] * analyzer.ret_1d["factor"]
+            else:
+                analyzer.ret_1d = analyzer.ret_1d["close"]
+            analyzer.ret_1d = analyzer.ret_1d / analyzer.ret_1d.shift(1) - 1
+            analyzer.ret_1d = analyzer.ret_1d.dropna(how="all")
+            signal_df = analyzer.signal_df.iloc[analyzer.balance_idx]
+            analyzer.cal_weights("equal", None)
+            gb = GroupBackTesting(analyzer.ret_1d, signal_df, weights=analyzer.weights)
+            group_ret = gb()
+            if isinstance(group_ret, pd.DataFrame) and group_ret.shape[1] >= 2:
+                top = group_ret.iloc[:, -1]
+                bot = group_ret.iloc[:, 0]
+                spread = top - bot
+                metrics["quantile"] = {
+                    "top_minus_bottom_daily": _series_summary(spread),
+                    "top_daily": _series_summary(top),
+                    "bottom_daily": _series_summary(bot),
+                }
+
+        if not args.no_turnover:
+            analyzer.turnover_analysis(weights_mode="equal")
+            # Numeric turnover (average per rebalance) can be derived from analyzer.weights
+            try:
+                analyzer.cal_weights("equal", None)
+                if analyzer.weights is not None and len(analyzer.weights) > 0:
+                    # Use top group turnover as a proxy for tradable portfolio turnover
+                    w = analyzer.weights[-1].fillna(0)
+                    # turnover per rebalance date = 0.5*sum(|Δw|)
+                    t = (w.diff().abs().sum(axis=1) / 2.0).dropna()
+                    metrics["turnover"] = {"top_group_avg": _safe_float(t.mean())}
+            except Exception:
+                pass
+
+        with open(os.path.join(out_subdir, "metrics.json"), "w", encoding="utf-8", newline="\n") as f:
+            json.dump(metrics, f, ensure_ascii=False, indent=2)
 
     signals = meta_raw.get("signals") or []
 
